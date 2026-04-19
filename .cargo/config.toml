@@ -1,0 +1,10 @@
+[target.thumbv8m.main-none-eabihf]
+runner = "sudo picotool load -u -v -x -t elf"
+
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    "-C", "target-cpu=cortex-m33",
+]
+
+[build]
+target = "thumbv8m.main-none-eabihf"
