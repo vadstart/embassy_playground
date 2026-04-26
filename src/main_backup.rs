@@ -6,31 +6,32 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pull};
+use embassy_rp::gpio::{AnyPin, Input, Pull};
 use embassy_rp::peripherals::{PIN_11, PIN_12, PIN_13, PIO0, PWM_SLICE5, PWM_SLICE6, USB};
 use embassy_rp::pio::{Instance, Pio};
 use embassy_rp::pio_programs::pwm::{PioPwm, PioPwmProgram};
 use embassy_rp::pwm::{Config, Pwm, PwmOutput, SetDutyCycle};
+// use embassy_rp::usb;
 use embassy_rp::usb::Driver;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::watch::Watch;
-use embassy_time::{Duration as EmbDuration, Instant, Timer};
+use embassy_sync::signal::Signal;
+use embassy_time::Timer;
 use log::info;
 use panic_halt as _;
 
-// Uncalibrated defaults for servo pulse width range
+// uncalibrated defaults
 const DEFAULT_MIN_PULSE_WIDTH: u64 = 1000;
 const DEFAULT_MAX_PULSE_WIDTH: u64 = 2000;
 const DEFAULT_MAX_DEGREE_ROTATION: u64 = 160;
-
-// Global state: Watch channel allows multiple receivers to await changes,
-// and always returns the latest value (no missed states).
-static STATE: Watch<ThreadModeRawMutex, bool, 3> = Watch::new();
+// Period of each cycle
+const REFRESH_INTERVAL: u64 = 20000;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
+
+static SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 
 pub struct ServoBuilder<'d, T: Instance, const SM: usize> {
     pwm: PioPwm<'d, T, SM>,
@@ -44,7 +45,7 @@ impl<'d, T: Instance, const SM: usize> ServoBuilder<'d, T, SM> {
     pub fn new(pwm: PioPwm<'d, T, SM>) -> Self {
         Self {
             pwm,
-            period: Duration::from_micros(20_000), // 20ms servo frame period
+            period: Duration::from_micros(REFRESH_INTERVAL),
             min_pulse_width: Duration::from_micros(DEFAULT_MIN_PULSE_WIDTH),
             max_pulse_width: Duration::from_micros(DEFAULT_MAX_PULSE_WIDTH),
             max_degree_rotation: DEFAULT_MAX_DEGREE_ROTATION,
@@ -60,12 +61,10 @@ impl<'d, T: Instance, const SM: usize> ServoBuilder<'d, T, SM> {
         self.min_pulse_width = duration;
         self
     }
-
     pub fn set_max_pulse_width(mut self, duration: Duration) -> Self {
         self.max_pulse_width = duration;
         self
     }
-
     pub fn set_max_degree_rotation(mut self, degree: u64) -> Self {
         self.max_degree_rotation = degree;
         self
@@ -109,7 +108,7 @@ impl<'d, T: Instance, const SM: usize> Servo<'d, T, SM> {
         let mut duration = Duration::from_nanos(
             degree * degree_per_nano_second + self.min_pulse_width.as_nanos() as u64,
         );
-        if duration > self.max_pulse_width {
+        if self.max_pulse_width < duration {
             duration = self.max_pulse_width;
         }
 
@@ -135,12 +134,11 @@ impl RgbLed {
         config.top = 65535;
         config.divider = 16u8.into();
 
-        // Start in red state to avoid a white flash while the task hasn't called set_red() yet.
-        // PWM slice6 compare_a drives the green LED, compare_b drives the red LED.
-        // High compare value = high duty cycle = pin low = LED on (active-low).
+        // Start in red state: r (b-channel) LOW = on, g (a-channel) HIGH = off, b HIGH = off.
+        // This avoids a white flash while the task hasn't called set_red() yet.
         let mut config_gr = config.clone();
-        config_gr.compare_a = 65535; // g on (red LED)
-        config_gr.compare_b = 0; // r off (green LED)
+        config_gr.compare_a = 65535; // g off
+        config_gr.compare_b = 0; // r on
 
         let mut config_b = config;
         config_b.compare_b = 65535; // b off
@@ -199,90 +197,28 @@ async fn ultrasonic(trig: Peri<'static, AnyPin>, echo: Peri<'static, AnyPin>) {
     let mut trig = Output::new(trig, Level::Low);
     let echo_pin = Input::new(echo, Pull::Down);
 
-    let mut rcv = STATE.receiver().unwrap();
-
     loop {
-        let active: bool = rcv.changed().await;
+        // trigger pulse
+        trig.set_high();
+        Timer::after_micros(10).await;
+        trig.set_low();
 
-        if !active {
-            info!("Sonar paused");
-            continue;
-        }
+        // wait for echo start
+        while echo.is_low() {}
+        let start = Instant::now();
 
-        info!("Sonar active");
-
-        loop {
-            // Trigger the HC-SR04 pulse
-            trig.set_high();
-            Timer::after_micros(10).await;
-            trig.set_low();
-
-            // Wait for echo start with timeout
-            let start = Instant::now();
-            let echo_start_found = loop {
-                let dur = Instant::now() - start;
-                if dur > EmbDuration::from_millis(20) {
-                    break None;
-                }
-                if echo_pin.is_high() {
-                    break Some(dur);
-                }
-                Timer::after_micros(100).await;
-            };
-
-            match echo_start_found {
-                Some(dur) => {
-                    info!("Echo start: {} us", dur.as_micros());
-                }
-                None => {
-                    info!("Echo start timeout");
-                    continue;
-                }
-            }
-
-            let start = Instant::now();
-
-            // Wait for echo end with timeout
-            let echo_dur = loop {
-                let dur = Instant::now() - start;
-                if dur > EmbDuration::from_millis(20) {
-                    break None;
-                }
-                if echo_pin.is_low() {
-                    break Some(dur);
-                }
-                Timer::after_micros(100).await;
-            };
-
-            match echo_dur {
-                Some(dur) => {
-                    let us = dur.as_micros() as f32;
-                    let distance = us * 0.0343 / 2.0;
-                    info!("Distance {} cm", distance);
-                }
-                None => {
-                    info!("Echo end timeout");
-                    continue;
-                }
-            }
-
-            // Non-blocking check for button state after measurement
-            if let Some(new_active) = rcv.try_changed() {
-                if !new_active {
-                    info!("Sonar paused mid-cycle");
-                    break;
-                }
-            }
-
-            Timer::after_millis(50).await;
-        }
+        // wait for echo end
+        while echo.is_high() {}
+        let duration = Instant::now() - start;
+        let us = duration.as_micros() as f32;
+        let distance = us * 0.0343 / 2.0;
+        info!("Distance {} cm", distance);
     }
 }
 
-/// Servo motor task. Sweeps the servo back and forth when the system is active.
-/// LED turns green when active (system running), red when paused.
 #[embassy_executor::task]
 async fn servo(mut led: RgbLed, pwm: PioPwm<'static, PIO0, 0>) {
+    let mut active = false;
     let mut degree: u64 = 0;
     let mut forward = true;
     led.set_red();
@@ -295,41 +231,37 @@ async fn servo(mut led: RgbLed, pwm: PioPwm<'static, PIO0, 0>) {
 
     servo.start();
 
-    let mut rcv = STATE.receiver().unwrap();
-
     loop {
-     let active = rcv.changed().await;
+        if let Some(new_state) = SIGNAL.try_take() {
+            active = new_state;
+            if active {
+                led.set_green();
+            } else {
+                led.set_red();
+            }
+        }
 
-     if active {
-         led.set_green();
-         loop {                              // ← new inner sweep loop
-             servo.rotate(degree);
-             if forward {
-                 if degree < 180 { degree += 1; }
-                 else { forward = false; degree -= 1; }
-             } else if degree > 0 {
-                 degree -= 1;
-             } else {
-             } else {
-                 forward = true;
-                 degree += 1;
-             }
+        if active {
+            servo.rotate(degree);
+            if forward {
+                if degree < 180 {
+                    degree += 1;
+                } else {
+                    forward = false;
+                    degree -= 1;
+                }
+            } else if degree > 0 {
+                degree -= 1;
+            } else {
+                forward = true;
+                degree += 1;
+            }
+        }
 
-             if let Some(false) = rcv.try_changed() {
-                 led.set_red();
-                 break;                     // ← exit inner loop on deactivation
-             }
+        Timer::after_millis(20).await;
+    }
+}
 
-             Timer::after_millis(20).await;
-         }
-     } else {
-         led.set_red();
-     }
- }
- }
-
-/// Button task. Toggles system active state on each press.
-/// Uses sender().send() which wakes any blocking receivers.
 #[embassy_executor::task(pool_size = 2)]
 async fn button(pin: Peri<'static, AnyPin>) {
     let mut button: Input<'static> = Input::new(pin, Pull::Up);
@@ -342,7 +274,7 @@ async fn button(pin: Peri<'static, AnyPin>) {
             continue; // noise or bounce, not a real press
         }
         running = !running;
-        STATE.sender().send(running);
+        SIGNAL.signal(running);
         info!("Sonar {}", if running { "active" } else { "paused" });
         button.wait_for_high().await;
         Timer::after_millis(50).await; // debounce release
